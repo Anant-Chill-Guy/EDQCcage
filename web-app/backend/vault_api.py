@@ -7,10 +7,11 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -42,7 +43,10 @@ def database():
     setup_security(conn)
     setup_hybrid(conn)
     conn.execute("CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt BLOB NOT NULL, password_hash BLOB NOT NULL, vault_salt BLOB NOT NULL)")
-    conn.execute("CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, filename TEXT NOT NULL, byte_size INTEGER NOT NULL, created_at INTEGER NOT NULL, nonce BLOB NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id))")
+    conn.execute("CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, filename TEXT NOT NULL, byte_size INTEGER NOT NULL, created_at INTEGER NOT NULL, nonce BLOB NOT NULL, storage_mode TEXT NOT NULL DEFAULT 'encrypted', FOREIGN KEY(account_id) REFERENCES accounts(id))")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+    if 'storage_mode' not in columns:
+        conn.execute("ALTER TABLE files ADD COLUMN storage_mode TEXT NOT NULL DEFAULT 'encrypted'")
     conn.commit()
     return conn
 
@@ -143,73 +147,94 @@ def logout(authorization: str | None = Header(default=None), user=Depends(sessio
 def list_files(user=Depends(session)):
     require_pico()
     with database() as db:
-        rows = db.execute("SELECT f.id,f.filename,f.byte_size,f.created_at,CASE WHEN p.file_id IS NULL THEN 0 ELSE 1 END FROM files f LEFT JOIN file_pqc p ON p.file_id=f.id WHERE f.account_id=? ORDER BY f.created_at DESC", (user["account_id"],)).fetchall()
-    return {"files": [{"id": r[0], "name": r[1], "size": r[2], "created_at": r[3], "key_protection": "ML-KEM-768 · Pico-bound" if r[4] else "Legacy password-protected"} for r in rows]}
+        rows = db.execute("SELECT id,filename,byte_size,created_at,storage_mode FROM files WHERE account_id=? ORDER BY created_at DESC", (user["account_id"],)).fetchall()
+    return {"files": [{"id": r[0], "name": r[1], "size": r[2], "created_at": r[3], "storage_mode": r[4], "key_protection": "AES-256-GCM · Pico · ML-KEM-768/X25519" if r[4] == 'encrypted' else "Unencrypted · Local storage"} for r in rows]}
 
 
 @router.post("/files", status_code=201)
-async def upload(file: UploadFile = File(...), user=Depends(session)):
+async def upload(file: UploadFile = File(...), mode: Literal['encrypted', 'plain'] = Form('encrypted'), user=Depends(session)):
     require_pico()
     data = await file.read(MAX_FILE + 1)
     await file.close()
     if len(data) > MAX_FILE:
-        raise HTTPException(413, "Phase 4 file limit is 16 MiB")
+        raise HTTPException(413, "File size limit is 16 MiB")
     name = Path((file.filename or "unnamed").replace("\\", "/")).name[:255]
     file_id = uuid.uuid4().hex
-    nonce = secrets.token_bytes(12)
-    with database() as db:
-        bound_key = key_for_account(db, user["account_id"], user["key"])
-    file_key = secrets.token_bytes(32)
-    blob = AESGCM(file_key).encrypt(nonce, data, (user["account_id"] + ":" + file_id).encode())
+    nonce = secrets.token_bytes(12) if mode == 'encrypted' else b''
+    if mode == 'encrypted':
+        with database() as db:
+            bound_key = key_for_account(db, user["account_id"], user["key"])
+        file_key = secrets.token_bytes(32)
+        blob = AESGCM(file_key).encrypt(nonce, data, (user["account_id"] + ":" + file_id).encode())
+    else:
+        blob = data
     path = BLOBS / (file_id + ".bin")
     with path.open("xb") as handle:
         os.chmod(path, 0o600)
         handle.write(blob)
     try:
         with database() as db:
-            db.execute("INSERT INTO files VALUES (?,?,?,?,?,?)", (file_id, user["account_id"], name, len(data), int(time.time()), nonce))
-            wrap_hybrid(db, user["account_id"], file_id, bound_key, file_key)
-            audit(db, user["account_id"], 'file.upload')
+            db.execute("INSERT INTO files (id,account_id,filename,byte_size,created_at,nonce,storage_mode) VALUES (?,?,?,?,?,?,?)", (file_id, user["account_id"], name, len(data), int(time.time()), nonce, mode))
+            if mode == 'encrypted':
+                wrap_hybrid(db, user["account_id"], file_id, bound_key, file_key)
+            audit(db, user["account_id"], 'file.upload_encrypted' if mode == 'encrypted' else 'file.upload_plain')
             db.commit()
     except Exception:
         path.unlink(missing_ok=True)
         raise
-    return {"id": file_id, "name": name, "size": len(data), "encrypted_at_rest": True, "key_protection": "ML-KEM-768 + X25519 hybrid"}
+    return {"id": file_id, "name": name, "size": len(data), "storage_mode": mode, "encrypted_at_rest": mode == 'encrypted'}
+
+
+def _file_response(file_id, user, expected_mode):
+    require_pico()
+    with database() as db:
+        row = db.execute("SELECT filename,nonce,storage_mode FROM files WHERE id=? AND account_id=?", (file_id, user["account_id"])).fetchone()
+    if row is None:
+        raise HTTPException(404, "File not found")
+    name, nonce, mode = row
+    if mode != expected_mode:
+        raise HTTPException(409, "Use Decrypt for encrypted files" if mode == 'encrypted' else "This file was stored without encryption")
+    try:
+        blob = (BLOBS / (file_id + ".bin")).read_bytes()
+        if mode == 'encrypted':
+            with database() as db:
+                if uses_pqc(db, file_id):
+                    bound_key = key_for_account(db, user["account_id"], user["key"])
+                    file_key = unwrap_hybrid(db, user["account_id"], file_id, bound_key) if is_hybrid(db, file_id) else unwrap_file_key(db, user["account_id"], file_id, bound_key)
+                else:
+                    file_key = user["key"]
+            content = AESGCM(file_key).decrypt(nonce, blob, (user["account_id"] + ":" + file_id).encode())
+        else:
+            content = blob
+    except (OSError, ValueError, InvalidTag):
+        raise HTTPException(422, "File could not be verified or opened")
+    with database() as db:
+        audit(db, user["account_id"], 'file.decrypt' if mode == 'encrypted' else 'file.open_plain')
+        db.commit()
+    from urllib.parse import quote
+    return Response(content=content, media_type="application/octet-stream", headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(name), "X-Storage-Mode": mode, "Cache-Control": "no-store"})
 
 
 @router.get("/files/{file_id}")
-def download(file_id: str, user=Depends(session)):
-    require_pico()
-    with database() as db:
-        row = db.execute("SELECT filename,nonce FROM files WHERE id=? AND account_id=?", (file_id, user["account_id"])).fetchone()
-    if row is None:
-        raise HTTPException(404, "File not found")
-    try:
-        blob = (BLOBS / (file_id + ".bin")).read_bytes()
-        with database() as db:
-            if uses_pqc(db, file_id):
-                bound_key = key_for_account(db, user["account_id"], user["key"])
-                file_key = unwrap_hybrid(db, user["account_id"], file_id, bound_key) if is_hybrid(db, file_id) else unwrap_file_key(db, user["account_id"], file_id, bound_key)
-            else:
-                file_key = user["key"]
-        data = AESGCM(file_key).decrypt(row[1], blob, (user["account_id"] + ":" + file_id).encode())
-    except (OSError, ValueError, InvalidTag):
-        raise HTTPException(422, "Encrypted file is unavailable or invalid")
-    with database() as db:
-        audit(db, user["account_id"], 'file.download')
-        db.commit()
-    return Response(content=data, media_type="application/octet-stream", headers={"Content-Disposition": "attachment; filename*=UTF-8''" + __import__("urllib.parse", fromlist=["quote"]).quote(row[0])})
+def open_plain_file(file_id: str, user=Depends(session)):
+    return _file_response(file_id, user, 'plain')
+
+
+@router.post("/files/{file_id}/decrypt")
+def decrypt_file(file_id: str, user=Depends(session)):
+    return _file_response(file_id, user, 'encrypted')
 
 
 @router.delete("/files/{file_id}")
 def delete(file_id: str, user=Depends(session)):
     require_pico()
     with database() as db:
-        found = db.execute("SELECT id FROM files WHERE id=? AND account_id=?", (file_id, user["account_id"])).fetchone()
+        found = db.execute("SELECT storage_mode FROM files WHERE id=? AND account_id=?", (file_id, user["account_id"])).fetchone()
         if found is None:
             raise HTTPException(404, "File not found")
-        remove_hybrid(db, file_id)
-        db.execute("DELETE FROM file_pqc WHERE file_id=?", (file_id,))
+        if found[0] == 'encrypted':
+            remove_hybrid(db, file_id)
+            db.execute("DELETE FROM file_pqc WHERE file_id=?", (file_id,))
         db.execute("DELETE FROM files WHERE id=? AND account_id=?", (file_id, user["account_id"]))
         audit(db, user["account_id"], 'file.delete')
         db.commit()

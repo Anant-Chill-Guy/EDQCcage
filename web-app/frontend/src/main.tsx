@@ -4,5 +4,6 @@ import App from './App'
 import './styles.css'
 import './reference.css'
 import './login.css'
+import './edqc-core.css'
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>)

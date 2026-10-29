@@ -1,11 +1,20 @@
-.venv/
-node_modules/
-dist/
-
-/web-app/frontend/tsconfig.tsbuildinfo
-
-web-app/frontend/tsconfig.tsbuildinfo
-
-__pycache__/
+# Secrets and runtime vault data
+.env
+.env.*
+!.env.example
 web-app/backend/.device_enrollment.json
 web-app/backend/.vault_data/
+pv_secret.bin
+pv_keyshare.bin
+*.edq
+
+# Python
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+
+# Frontend
+web-app/frontend/node_modules/
+web-app/frontend/dist/
+web-app/frontend/*.tsbuildinfo

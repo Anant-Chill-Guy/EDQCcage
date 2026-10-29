@@ -92,3 +92,27 @@ def key_derive(account_hex):
     if len(account) != 16:
         raise ValueError('invalid_account_id')
     print('PV_FACTOR:' + _hex(_hmac(_device_key(), KEY_DOMAIN + b'account/' + account)))
+
+
+def menu():
+    print('PV_MENU:1 DEVICE STATUS')
+    print('PV_MENU:2 AUTHENTICATE')
+    print('PV_MENU:3 KEY STATUS')
+    print('PV_MENU:4 SELF TEST')
+    print('PV_MENU:5 EXIT')
+
+def device_status():
+    print('PV_STATUS:ENROLLED' if enrolled() else 'PV_STATUS:UNENROLLED')
+    try:
+        key_identify()
+        print('PV_STATUS:KEY_READY')
+    except ValueError:
+        print('PV_STATUS:KEY_MISSING')
+
+def self_test():
+    try:
+        known = _hmac(b'\x0b' * 20, b'Hi There')
+        result = enrolled() and len(_device_key()) == 32 and _hex(known) == 'b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7'
+    except (OSError, ValueError):
+        result = False
+    print('PV_SELFTEST:PASS' if result else 'PV_SELFTEST:FAIL')

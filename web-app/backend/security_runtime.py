@@ -66,7 +66,7 @@ def login_success(db, username):
 
 def audit(db, account_id, event, now=None):
     setup(db)
-    allowed = {'account.register', 'account.login', 'account.login_failed', 'account.logout', 'file.upload', 'file.download', 'file.delete', 'record.create', 'record.reveal', 'record.delete'}
+    allowed = {'account.register', 'account.login', 'account.login_failed', 'account.logout', 'file.upload', 'file.download', 'file.delete', 'file.upload_encrypted', 'file.upload_plain', 'file.decrypt', 'file.open_plain', 'record.create', 'record.reveal', 'record.delete'}
     if event not in allowed:
         raise ValueError('Unrecognized audit event')
     now = int(time.time()) if now is None else int(now)
