@@ -50,4 +50,27 @@ def device_authenticate():
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+from records_api import router as records_router
+app.include_router(records_router)
 app.include_router(vault_router)
+from audit_api import router as audit_router
+app.include_router(audit_router)
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost'])
+
+
+@app.middleware('http')
+async def protect_local_requests(request: Request, call_next):
+    origin = request.headers.get('origin')
+    if origin and origin not in ('http://127.0.0.1:5173', 'http://localhost:5173'):
+        return JSONResponse({'detail': 'Untrusted origin'}, status_code=403)
+    response = await call_next(request)
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Frame-Options'] = 'DENY'
+    return response
