@@ -15,6 +15,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from hardware_auth import authenticate_device
+from key_binding import key_for_account, setup as setup_hardware
 from pqc_storage import setup, initialize_account, wrap_file_key, unwrap_file_key, uses_pqc
 
 router = APIRouter(prefix="/api/vault")
@@ -32,6 +33,7 @@ def database():
     conn = sqlite3.connect(DB, timeout=10)
     conn.execute("PRAGMA foreign_keys=ON")
     setup(conn)
+    setup_hardware(conn)
     conn.execute("CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt BLOB NOT NULL, password_hash BLOB NOT NULL, vault_salt BLOB NOT NULL)")
     conn.execute("CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, filename TEXT NOT NULL, byte_size INTEGER NOT NULL, created_at INTEGER NOT NULL, nonce BLOB NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id))")
     conn.commit()
@@ -92,7 +94,7 @@ def login(payload: Credentials):
         raise HTTPException(401, "Invalid credentials")
     account_key = derive(payload.password, row[3])
     with database() as db:
-        initialize_account(db, row[0], account_key)
+        key_for_account(db, row[0], account_key, migrate=True)
         db.commit()
     token = secrets.token_urlsafe(32)
     with LOCK:
@@ -111,8 +113,8 @@ def logout(authorization: str | None = Header(default=None), user=Depends(sessio
 def list_files(user=Depends(session)):
     require_pico()
     with database() as db:
-        rows = db.execute("SELECT id,filename,byte_size,created_at FROM files WHERE account_id=? ORDER BY created_at DESC", (user["account_id"],)).fetchall()
-    return {"files": [{"id": r[0], "name": r[1], "size": r[2], "created_at": r[3]} for r in rows]}
+        rows = db.execute("SELECT f.id,f.filename,f.byte_size,f.created_at,CASE WHEN p.file_id IS NULL THEN 0 ELSE 1 END FROM files f LEFT JOIN file_pqc p ON p.file_id=f.id WHERE f.account_id=? ORDER BY f.created_at DESC", (user["account_id"],)).fetchall()
+    return {"files": [{"id": r[0], "name": r[1], "size": r[2], "created_at": r[3], "key_protection": "ML-KEM-768 · Pico-bound" if r[4] else "Legacy password-protected"} for r in rows]}
 
 
 @router.post("/files", status_code=201)
@@ -125,6 +127,8 @@ async def upload(file: UploadFile = File(...), user=Depends(session)):
     name = Path((file.filename or "unnamed").replace("\\", "/")).name[:255]
     file_id = uuid.uuid4().hex
     nonce = secrets.token_bytes(12)
+    with database() as db:
+        bound_key = key_for_account(db, user["account_id"], user["key"])
     file_key = secrets.token_bytes(32)
     blob = AESGCM(file_key).encrypt(nonce, data, (user["account_id"] + ":" + file_id).encode())
     path = BLOBS / (file_id + ".bin")
@@ -134,7 +138,7 @@ async def upload(file: UploadFile = File(...), user=Depends(session)):
     try:
         with database() as db:
             db.execute("INSERT INTO files VALUES (?,?,?,?,?,?)", (file_id, user["account_id"], name, len(data), int(time.time()), nonce))
-            wrap_file_key(db, user["account_id"], file_id, user["key"], file_key)
+            wrap_file_key(db, user["account_id"], file_id, bound_key, file_key)
             db.commit()
     except Exception:
         path.unlink(missing_ok=True)
@@ -152,7 +156,7 @@ def download(file_id: str, user=Depends(session)):
     try:
         blob = (BLOBS / (file_id + ".bin")).read_bytes()
         with database() as db:
-            file_key = unwrap_file_key(db, user["account_id"], file_id, user["key"]) if uses_pqc(db, file_id) else user["key"]
+            file_key = unwrap_file_key(db, user["account_id"], file_id, key_for_account(db, user["account_id"], user["key"])) if uses_pqc(db, file_id) else user["key"]
         data = AESGCM(file_key).decrypt(row[1], blob, (user["account_id"] + ":" + file_id).encode())
     except (OSError, ValueError, InvalidTag):
         raise HTTPException(422, "Encrypted file is unavailable or invalid")
@@ -171,3 +175,13 @@ def delete(file_id: str, user=Depends(session)):
         db.commit()
     (BLOBS / (file_id + ".bin")).unlink(missing_ok=True)
     return {"deleted": True}
+
+
+@router.get("/me")
+def current_account(user=Depends(session)):
+    require_pico()
+    with database() as db:
+        row = db.execute("SELECT username FROM accounts WHERE id=?", (user["account_id"],)).fetchone()
+    if row is None:
+        raise HTTPException(401, "Account not found")
+    return {"username": row[0], "authenticated": True, "hardware_required": True}

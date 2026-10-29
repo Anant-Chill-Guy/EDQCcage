@@ -47,3 +47,48 @@ def respond(challenge_hex):
         print('PV_RESPONSE:' + _hex(_hmac(secret, b'PicoVault/v1/auth/' + challenge)))
     except (OSError, ValueError):
         print('PV_ERROR:not_enrolled')
+
+DEVICE_KEY_FILE = 'pv_keyshare.bin'
+KEY_DOMAIN = b'PicoVault/v3/physical-key/'
+
+
+def _device_key():
+    try:
+        with open(DEVICE_KEY_FILE, 'rb') as handle:
+            secret = handle.read()
+    except OSError:
+        raise ValueError('device_key_not_provisioned')
+    if len(secret) != 32:
+        raise ValueError('device_key_invalid')
+    return secret
+
+
+def provision(seed_hex):
+    try:
+        existing = _device_key()
+        print('PV_DEVICE_ID:' + _hex(hashlib.sha256(KEY_DOMAIN + existing).digest()))
+        return
+    except ValueError as exc:
+        if str(exc) != 'device_key_not_provisioned':
+            raise
+    if len(seed_hex) != 64:
+        raise ValueError('invalid_seed')
+    seed = _unhex(seed_hex)
+    secret = hashlib.sha256(KEY_DOMAIN + os.urandom(32) + seed).digest()
+    with open(DEVICE_KEY_FILE, 'wb') as handle:
+        handle.write(secret)
+    print('PV_DEVICE_ID:' + _hex(hashlib.sha256(KEY_DOMAIN + secret).digest()))
+
+
+def key_identify():
+    secret = _device_key()
+    print('PV_DEVICE_ID:' + _hex(hashlib.sha256(KEY_DOMAIN + secret).digest()))
+
+
+def key_derive(account_hex):
+    if len(account_hex) != 32:
+        raise ValueError('invalid_account_id')
+    account = _unhex(account_hex)
+    if len(account) != 16:
+        raise ValueError('invalid_account_id')
+    print('PV_FACTOR:' + _hex(_hmac(_device_key(), KEY_DOMAIN + b'account/' + account)))

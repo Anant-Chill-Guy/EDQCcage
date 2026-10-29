@@ -10,12 +10,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 @app.get("/api/health")
 def health():
-    return {"service": "picovault-hardware", "status": "running", "mode": "read-only"}
+    return {"service": "picovault-hardware", "status": "running", "mode": "local development"}
 
 @app.get("/api/device")
 def device():
@@ -29,7 +29,7 @@ def device():
         "description": selected.description if selected else None,
         "vid": selected.vid if selected else None,
         "pid": selected.pid if selected else None,
-        "protocol": "USB enumeration only; device authentication not implemented",
+        "protocol": "HMAC-SHA256 challenge-response via /api/device/authenticate",
     }
 
 @app.get('/api/device/auth-status')
