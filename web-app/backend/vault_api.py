@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from hardware_auth import authenticate_device
 from key_binding import key_for_account, setup as setup_hardware
 from pqc_storage import setup, initialize_account, wrap_file_key, unwrap_file_key, uses_pqc
+from hybrid_v4 import setup as setup_hybrid, wrap as wrap_hybrid, unwrap as unwrap_hybrid, is_hybrid, remove as remove_hybrid
 
 router = APIRouter(prefix="/api/vault")
 BASE = Path(__file__).resolve().parent / ".vault_data"
@@ -34,6 +35,7 @@ def database():
     conn.execute("PRAGMA foreign_keys=ON")
     setup(conn)
     setup_hardware(conn)
+    setup_hybrid(conn)
     conn.execute("CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt BLOB NOT NULL, password_hash BLOB NOT NULL, vault_salt BLOB NOT NULL)")
     conn.execute("CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, filename TEXT NOT NULL, byte_size INTEGER NOT NULL, created_at INTEGER NOT NULL, nonce BLOB NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id))")
     conn.commit()
@@ -138,12 +140,12 @@ async def upload(file: UploadFile = File(...), user=Depends(session)):
     try:
         with database() as db:
             db.execute("INSERT INTO files VALUES (?,?,?,?,?,?)", (file_id, user["account_id"], name, len(data), int(time.time()), nonce))
-            wrap_file_key(db, user["account_id"], file_id, bound_key, file_key)
+            wrap_hybrid(db, user["account_id"], file_id, bound_key, file_key)
             db.commit()
     except Exception:
         path.unlink(missing_ok=True)
         raise
-    return {"id": file_id, "name": name, "size": len(data), "encrypted_at_rest": True, "key_protection": "ML-KEM-768"}
+    return {"id": file_id, "name": name, "size": len(data), "encrypted_at_rest": True, "key_protection": "ML-KEM-768 + X25519 hybrid"}
 
 
 @router.get("/files/{file_id}")
@@ -156,7 +158,11 @@ def download(file_id: str, user=Depends(session)):
     try:
         blob = (BLOBS / (file_id + ".bin")).read_bytes()
         with database() as db:
-            file_key = unwrap_file_key(db, user["account_id"], file_id, key_for_account(db, user["account_id"], user["key"])) if uses_pqc(db, file_id) else user["key"]
+            if uses_pqc(db, file_id):
+                bound_key = key_for_account(db, user["account_id"], user["key"])
+                file_key = unwrap_hybrid(db, user["account_id"], file_id, bound_key) if is_hybrid(db, file_id) else unwrap_file_key(db, user["account_id"], file_id, bound_key)
+            else:
+                file_key = user["key"]
         data = AESGCM(file_key).decrypt(row[1], blob, (user["account_id"] + ":" + file_id).encode())
     except (OSError, ValueError, InvalidTag):
         raise HTTPException(422, "Encrypted file is unavailable or invalid")
@@ -170,6 +176,7 @@ def delete(file_id: str, user=Depends(session)):
         found = db.execute("SELECT id FROM files WHERE id=? AND account_id=?", (file_id, user["account_id"])).fetchone()
         if found is None:
             raise HTTPException(404, "File not found")
+        remove_hybrid(db, file_id)
         db.execute("DELETE FROM file_pqc WHERE file_id=?", (file_id,))
         db.execute("DELETE FROM files WHERE id=? AND account_id=?", (file_id, user["account_id"]))
         db.commit()
