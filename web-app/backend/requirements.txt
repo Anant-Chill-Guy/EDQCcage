@@ -4,3 +4,4 @@ pyserial>=3.5,<4
 mpremote>=1.24,<2
 cryptography>=44,<48
 python-multipart>=0.0.20,<1
+pqcrypto>=0.3.4,<1

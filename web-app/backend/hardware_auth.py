@@ -15,7 +15,7 @@ PREFIX = b'PicoVault/v1/auth/'
 def get_port():
     devices = [port.device for port in list_ports.comports() if port.vid == 0x2E8A and port.pid == 0x0005]
     if not devices:
-        raise RuntimeError('No running MicroPython Pico detected')
+        raise RuntimeError('No Device Detected')
     if len(devices) != 1:
         raise RuntimeError('Connect exactly one MicroPython Pico to enroll or authenticate')
     return devices[0]

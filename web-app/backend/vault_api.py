@@ -15,6 +15,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from hardware_auth import authenticate_device
+from pqc_storage import setup, initialize_account, wrap_file_key, unwrap_file_key, uses_pqc
 
 router = APIRouter(prefix="/api/vault")
 BASE = Path(__file__).resolve().parent / ".vault_data"
@@ -30,6 +31,7 @@ def database():
     BLOBS.mkdir(parents=True, exist_ok=True, mode=0o700)
     conn = sqlite3.connect(DB, timeout=10)
     conn.execute("PRAGMA foreign_keys=ON")
+    setup(conn)
     conn.execute("CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt BLOB NOT NULL, password_hash BLOB NOT NULL, vault_salt BLOB NOT NULL)")
     conn.execute("CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, filename TEXT NOT NULL, byte_size INTEGER NOT NULL, created_at INTEGER NOT NULL, nonce BLOB NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id))")
     conn.commit()
@@ -88,9 +90,13 @@ def login(payload: Credentials):
     candidate = derive(payload.password, candidate_salt)
     if row is None or not hmac.compare_digest(candidate, row[2]):
         raise HTTPException(401, "Invalid credentials")
+    account_key = derive(payload.password, row[3])
+    with database() as db:
+        initialize_account(db, row[0], account_key)
+        db.commit()
     token = secrets.token_urlsafe(32)
     with LOCK:
-        SESSIONS[hashlib.sha256(token.encode()).digest()] = {"account_id": row[0], "key": derive(payload.password, row[3]), "expires": time.time() + 1800}
+        SESSIONS[hashlib.sha256(token.encode()).digest()] = {"account_id": row[0], "key": account_key, "expires": time.time() + 1800}
     return {"access_token": token, "token_type": "bearer", "expires_in": 1800}
 
 
@@ -119,7 +125,8 @@ async def upload(file: UploadFile = File(...), user=Depends(session)):
     name = Path((file.filename or "unnamed").replace("\\", "/")).name[:255]
     file_id = uuid.uuid4().hex
     nonce = secrets.token_bytes(12)
-    blob = AESGCM(user["key"]).encrypt(nonce, data, (user["account_id"] + ":" + file_id).encode())
+    file_key = secrets.token_bytes(32)
+    blob = AESGCM(file_key).encrypt(nonce, data, (user["account_id"] + ":" + file_id).encode())
     path = BLOBS / (file_id + ".bin")
     with path.open("xb") as handle:
         os.chmod(path, 0o600)
@@ -127,11 +134,12 @@ async def upload(file: UploadFile = File(...), user=Depends(session)):
     try:
         with database() as db:
             db.execute("INSERT INTO files VALUES (?,?,?,?,?,?)", (file_id, user["account_id"], name, len(data), int(time.time()), nonce))
+            wrap_file_key(db, user["account_id"], file_id, user["key"], file_key)
             db.commit()
     except Exception:
         path.unlink(missing_ok=True)
         raise
-    return {"id": file_id, "name": name, "size": len(data), "encrypted_at_rest": True}
+    return {"id": file_id, "name": name, "size": len(data), "encrypted_at_rest": True, "key_protection": "ML-KEM-768"}
 
 
 @router.get("/files/{file_id}")
@@ -143,7 +151,9 @@ def download(file_id: str, user=Depends(session)):
         raise HTTPException(404, "File not found")
     try:
         blob = (BLOBS / (file_id + ".bin")).read_bytes()
-        data = AESGCM(user["key"]).decrypt(row[1], blob, (user["account_id"] + ":" + file_id).encode())
+        with database() as db:
+            file_key = unwrap_file_key(db, user["account_id"], file_id, user["key"]) if uses_pqc(db, file_id) else user["key"]
+        data = AESGCM(file_key).decrypt(row[1], blob, (user["account_id"] + ":" + file_id).encode())
     except (OSError, ValueError, InvalidTag):
         raise HTTPException(422, "Encrypted file is unavailable or invalid")
     return Response(content=data, media_type="application/octet-stream", headers={"Content-Disposition": "attachment; filename*=UTF-8''" + __import__("urllib.parse", fromlist=["quote"]).quote(row[0])})
@@ -156,6 +166,7 @@ def delete(file_id: str, user=Depends(session)):
         found = db.execute("SELECT id FROM files WHERE id=? AND account_id=?", (file_id, user["account_id"])).fetchone()
         if found is None:
             raise HTTPException(404, "File not found")
+        db.execute("DELETE FROM file_pqc WHERE file_id=?", (file_id,))
         db.execute("DELETE FROM files WHERE id=? AND account_id=?", (file_id, user["account_id"]))
         db.commit()
     (BLOBS / (file_id + ".bin")).unlink(missing_ok=True)
