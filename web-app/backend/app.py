@@ -1,3 +1,4 @@
+from vault_api import router as vault_router
 from hardware_auth import authenticate_device, enroll_device, status
 from fastapi import HTTPException
 from fastapi import FastAPI
@@ -8,7 +9,7 @@ app = FastAPI(title="PicoVault Hardware Service", docs_url=None, redoc_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -48,3 +49,5 @@ def device_authenticate():
         return authenticate_device()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+app.include_router(vault_router)
