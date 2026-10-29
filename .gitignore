@@ -7,3 +7,4 @@ dist/
 web-app/frontend/tsconfig.tsbuildinfo
 
 __pycache__/
+web-app/backend/.device_enrollment.json
