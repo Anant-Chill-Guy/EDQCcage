@@ -1,3 +1,9 @@
 .venv/
 node_modules/
 dist/
+
+/web-app/frontend/tsconfig.tsbuildinfo
+
+web-app/frontend/tsconfig.tsbuildinfo
+
+__pycache__/
