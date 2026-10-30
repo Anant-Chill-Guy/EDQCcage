@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from hybrid_v4 import remove, unwrap, wrap
 from key_binding import key_for_account
-from vault_api import database, require_pico, session
+from vault_api import database, require_records, session
 from security_runtime import audit
 
 router = APIRouter(prefix="/api/vault/records")
@@ -49,7 +49,7 @@ def no_store(data, status_code=200):
 
 @router.post("", status_code=201)
 def create_record(payload: RecordInput, user=Depends(session)):
-    require_pico()
+    require_records(user)
     account_id = user["account_id"]
     record_id = uuid.uuid4().hex
     data = payload.model_dump()
@@ -59,7 +59,7 @@ def create_record(payload: RecordInput, user=Depends(session)):
     encrypted = AESGCM(record_key).encrypt(nonce, raw, AAD + account_id.encode() + record_id.encode() + payload.kind.encode())
     with database() as db:
         setup(db)
-        bound_key = key_for_account(db, account_id, user["key"])
+        bound_key = key_for_account(db, account_id, user["key"], migrate=True)
         wrap(db, account_id, record_id, bound_key, record_key)
         db.execute("INSERT INTO vault_records VALUES (?,?,?,?,?,?)", (record_id, account_id, payload.kind, nonce, encrypted, int(time.time())))
         audit(db, account_id, 'record.create')
@@ -69,7 +69,7 @@ def create_record(payload: RecordInput, user=Depends(session)):
 
 @router.get("")
 def list_records(user=Depends(session)):
-    require_pico()
+    require_records(user)
     account_id = user["account_id"]
     with database() as db:
         setup(db)
@@ -86,7 +86,7 @@ def list_records(user=Depends(session)):
 
 @router.get("/{record_id}")
 def get_record(record_id: str, user=Depends(session)):
-    require_pico()
+    require_records(user)
     account_id = user["account_id"]
     with database() as db:
         setup(db)
@@ -102,7 +102,7 @@ def get_record(record_id: str, user=Depends(session)):
 
 @router.delete("/{record_id}")
 def delete_record(record_id: str, user=Depends(session)):
-    require_pico()
+    require_records(user)
     account_id = user["account_id"]
     with database() as db:
         setup(db)
